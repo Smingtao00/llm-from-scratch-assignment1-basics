@@ -3,6 +3,10 @@ import multiprocessing as mp
 from collections import Counter, defaultdict
 from typing import BinaryIO
 import regex as re
+import json
+from typing import Iterator, Iterable
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -79,7 +83,7 @@ def process_chunk(
         
     division = "|".join(re.escape(tok) for tok in special_tokens)
     slices = re.split(division, text)
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    
 
     for each in slices:
         if each:
@@ -185,7 +189,91 @@ def bpe(
     return vocab, merges
 
 
+def split_by_special(text, special_tokens):
+    if not special_tokens:
+        return [text]
+
+    special_tokens = sorted(special_tokens, key=len, reverse=True)
+
+    pattern = "|".join(re.escape(tok) for tok in special_tokens)
+    pattern = f"({pattern})"
+
+    pattern = re.compile(pattern)
+    chunks = pattern.split(text)
+    return [c for c in chunks if c]
 
 
+def apply_merges(word_bytes, merges, vocab2id):
+    word_bytes = list(word_bytes)
 
+    while True:
+        min_token_id = float('inf')
+        best_pair_idx = -1
+        merged = None
+
+        for i in range(len(word_bytes) - 1):
+            pair = (word_bytes[i], word_bytes[i + 1])
+            if pair in merges:
+                combined = pair[0] + pair[1]
+                token_id = vocab2id.get(combined)
+                if token_id is not None and token_id < min_token_id:
+                    min_token_id = token_id
+                    best_pair_idx = i
+                    merged = combined
+        
+        if best_pair_idx == -1:
+            break
+            
+        word_bytes = word_bytes[:best_pair_idx] + [merged] + word_bytes[best_pair_idx + 2:]
+    return tuple(word_bytes)
+
+
+def encode_merged(text, merges, vocab2id):
+    word_list = re.finditer(PAT, text)
+    tokens = []
+    for match in word_list:
+        word_bytes = word2bytes(match.group())
+        merged_word_bytes = apply_merges(word_bytes, merges, vocab2id)
+        tokens.extend(vocab2id[i] for i in merged_word_bytes)
+    return tokens
+
+
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        self.vocab = vocab
+        self.merges = set(merges)
+        self.special_tokens = special_tokens if special_tokens else []
+        self.special_tokens_bytes = [i.encode('utf-8') for i in self.special_tokens]
+        self.vocab2id = {v:k for k, v in vocab.items()}
+
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        with open(vocab_filepath, 'r', encoding = 'utf-8') as vf:
+            vocab_data = json.load(vf)
+            vocab = {int(k): bytes(v, 'latin1') if isinstance(v, str) else bytes(v) for k, v in vocab_data.items()}
+
+        # 假设都是 ("a b")
+        with open(merges_filepath, 'r', encoding = 'utf-8') as mf:
+            lines = mf.readlines()
+            merge_pairs = [tuple(line.strip().split()) for line in lines if not line.startswith('#') and line.strip()]
+            merges = [(a.encode('utf-8'), b.encode('utf-8')) for a, b in merge_pairs]
+
+        return cls(vocab = vocab, merges = merges, special_tokens = special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        chunks = split_by_special(text, self.special_tokens)
+        tokens = []
+        for chunk in chunks:
+            if self.special_tokens and chunk in self.special_tokens:
+                tokens.append(self.vocab2id[chunk.encode('utf-8')])
+            else:
+                tokens.extend(encode_merged(chunk, self.merges, self.vocab2id))
+        return tokens
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for chunk in iterable:
+            yield from self.encode(chunk)
+
+    def decode(self, ids: list[int]) -> str:
+        return b''.join([self.vocab[t] for t in ids]).decode('utf-8', errors = 'replace')
     
