@@ -1,19 +1,20 @@
 import torch
 import torch.nn as nn
 from einops import einsum
+from jaxtyping import Float,Bool,Int
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
         super().__init__()
-        self.weights = nn.Parameter(torch.empty(
+        self.weight = nn.Parameter(torch.empty(
             (out_features, in_features),
             device=device,
             dtype=dtype
         ))
-        nn.init.trunc_normal_(self.weights)
+        nn.init.trunc_normal_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor: # x is row vector
-        return x @ self.weights.T
+        return x @ self.weight.T
 
 
 class Embedding(nn.Module):
@@ -28,16 +29,16 @@ class Embedding(nn.Module):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.embedding_matrix = nn.Parameter(torch.empty(
+        self.weight = nn.Parameter(torch.empty(
             (num_embeddings, embedding_dim),
             device=device,
             dtype=dtype
         ))
-        nn.init.trunc_normal_(self.embedding_matrix)
+        nn.init.trunc_normal_(self.weight)
     
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         # Lookup for the given token IDs
-        return self.embedding_matrix[token_ids]
+        return self.weight[token_ids]
 
 
 class RMSNorm(nn.Module):
@@ -58,6 +59,287 @@ class RMSNorm(nn.Module):
         x = x.to(torch.float32)
         rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         x_norm = x / rms
-        result = torch.einsum("...i,i->...i", x_norm, self.weight)
+        result = x_norm * self.weight
 
         return result.to(in_dtype)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff, device=None, dtype=None):
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff, device, dtype)
+        self.w2 = Linear(d_ff, d_model, device, dtype)
+        self.w3 = Linear(d_model, d_ff, device, dtype)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #W1x = torch.einsum("ij,...j->...i", self.w1.weight, x)
+        W1x = self.w1(x)
+        sig_W1x = torch.sigmoid(W1x)
+        SiLU_W1x = torch.einsum("...i,...i->...i", W1x, sig_W1x)
+        #W3x = torch.einsum('ij,...j->...i', self.w3.weight, x)
+        W3x = self.w3(x)
+        SiLU_W1x_times_W3x = torch.einsum('...i,...i->...i', SiLU_W1x, W3x)
+        #SwiGLU_x = torch.einsum('ij,...j->...i', self.w2.weight, SiLU_W1x_times_W3x)
+        SwiGLU_x = self.w2(SiLU_W1x_times_W3x)
+        return SwiGLU_x
+
+
+class RoPE(nn.Module):
+    def __init__(self, theta: float, d_k, max_seq_len:int, device=None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+
+        position = torch.arange(max_seq_len, device=device).float()
+        idx = torch.arange(0, d_k, 2, device=device).float() / d_k
+        inv_freq = 1.0 / (theta ** idx)
+
+        angles = torch.einsum("i,j->ij", position, inv_freq)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        # (max_seq_len, d_k/2)
+
+        self.register_buffer('cos_cached', cos, persistent=False)
+        self.register_buffer('sin_cached', sin, persistent=False)
+    
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        cos = self.cos_cached[token_positions] 
+        sin = self.sin_cached[token_positions]
+        # (..., seq_len, d_k/2)
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        # (..., seq_len, d_k/2)
+
+        x_rotated_even = torch.einsum('...i,...i->...i', x_even, cos) - torch.einsum('...i,...i->...i', x_odd, sin)
+        x_rotated_odd = torch.einsum('...i,...i->...i', x_even, sin) + torch.einsum('...i,...i->...i', x_odd, cos)
+
+        x_rotated = torch.empty_like(x)
+        x_rotated[..., 0::2] = x_rotated_even
+        x_rotated[..., 1::2] = x_rotated_odd
+
+        return x_rotated
+
+
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    max_vals = torch.max(x, dim = dim, keepdim=True).values
+    x_stabel = x - max_vals
+    exp_x = torch.exp(x_stabel) 
+    sum_exp = torch.sum(exp_x, dim=dim, keepdim=True)
+    softmax = exp_x / sum_exp
+
+    return softmax
+
+
+def scaled_dot_product_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask=None
+) -> torch.Tensor:
+    """
+    Args:
+        Q: (..., queries, d_k)
+        K: (..., keys, d_k)
+        V: (..., values, d_v)
+        mask: (..., queries, keys) 
+    Output:
+        (..., querys, d_v)
+    """
+    d_k = Q.shape[-1]
+    attention_scores = torch.einsum('...qd,...kd->...qk', Q, K)
+    attention_scores = attention_scores / torch.sqrt(torch.tensor(d_k, dtype=Q.dtype, device=Q.device))
+
+    if mask is not None:
+        attention_scores = attention_scores.masked_fill(mask == False, float('-inf'))
+    
+    attention_weights = softmax(attention_scores, dim=-1)
+    output = torch.einsum('...qk,...kv->...qv', attention_weights, V)
+
+    return output
+
+
+class multihead_self_attention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int = 2048,
+        theta: float = 10000.0,
+        use_rope: bool =False,
+        device=None,
+        dtype=None
+    ):
+        super().__init__();
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads 
+        self.d_v = d_model // num_heads
+        self.max_seq_len = max_seq_len
+        self.use_rope = use_rope
+
+        self.q_proj = Linear(d_model, num_heads * self.d_k, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, num_heads * self.d_k, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, num_heads * self.d_v, device=device, dtype=dtype)
+        self.output_proj = Linear(num_heads * self.d_v, d_model, device=device, dtype=dtype)
+
+        if use_rope:
+            self.rope = RoPE(d_k=self.d_k, theta=theta, max_seq_len=max_seq_len, device=device)
+        else:
+            self.rope = None
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: (..., sequence_len, d_in(d_model))
+        positions: (..., sequence_len)
+        """
+        batch_shape = x.shape[:-2]
+        seq_len = x.shape[-2]
+
+        Q = self.q_proj(x) 
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+        # (..., seq_len, num_heads * d_k/d_v)
+
+        Q = Q.view(*batch_shape, seq_len, self.num_heads, self.d_k)
+        K = K.view(*batch_shape, seq_len, self.num_heads, self.d_k)
+        V = V.view(*batch_shape, seq_len, self.num_heads, self.d_v)
+
+        Q = Q.transpose(-3, -2)
+        K = K.transpose(-3, -2)
+        V = V.transpose(-3, -2)
+
+        if self.use_rope and self.rope is not None:
+            if positions is None:
+                positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
+                for _ in range(len(batch_shape)):
+                    positions = positions.unsqueeze(0)
+                positions = positions.expand(*batch_shape, seq_len)
+            
+            Q_shape = Q.shape
+            K_shape = K.shape 
+
+            Q_for_rope = Q.reshape(-1, seq_len, self.d_k)
+            K_for_rope = K.reshape(-1, seq_len, self.d_k)
+
+            pos_for_rope = positions.unsqueeze(-2).expand(*batch_shape, self.num_heads, seq_len)
+            pos_for_rope = pos_for_rope.reshape(-1, seq_len)
+
+            Q_for_rope = self.rope(Q_for_rope, pos_for_rope)
+            K_for_rope = self.rope(K_for_rope, pos_for_rope)
+
+            Q = Q_for_rope.reshape(Q_shape)
+            K = K_for_rope.reshape(K_shape)
+        
+        mask = torch.tril(
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device),
+            diagonal=0
+        )
+        mask = mask.view(1, 1, seq_len, seq_len)
+        target_shape = (*batch_shape, self.num_heads, seq_len, seq_len)
+        mask = mask.expand(target_shape)
+
+        attention_output = scaled_dot_product_attention(Q, K, V, mask)
+
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = attention_output.view(*batch_shape, seq_len, self.num_heads * self.d_v)
+
+        output = self.output_proj(attention_output)
+
+        return output
+
+
+class transformer_block(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int = 2048,
+        theta: float = 10000.0
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+        self.attn = multihead_self_attention(
+            d_model=d_model,
+            num_heads=num_heads,
+            max_seq_len=max_seq_len,
+            theta=theta,
+            use_rope=True
+        )
+        self.ffn = SwiGLU(
+            d_model=d_model,
+            d_ff=d_ff
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor
+    ):
+        y = x + self.attn(self.ln1(x))
+        return y + self.ffn(self.ln2(y))
+        
+
+class transformer_lm(nn.Module):
+    def __init__(
+        self, 
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+
+        self.token_embeddings = Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=d_model
+        )
+
+        self.layers = nn.ModuleList([
+            transformer_block(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                max_seq_len=context_length,
+                theta=rope_theta,
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.ln_final = RMSNorm(
+            d_model=d_model
+        )
+
+        self.lm_head = Linear(
+            in_features=d_model,
+            out_features=vocab_size
+        )
+
+    def forward(self, x : torch.Tensor) -> torch.Tensor:
+        """
+        x: Int(Tensor, ["batch_size sequence_length"])
+        """
+        y = self.token_embeddings(x)
+        # (batch_size, seq_len, d_model)
+
+        for layer in self.layers:
+            y = layer(y)
+
+        y = self.ln_final(y)
+
+        logits = self.lm_head(y)
+
+        return logits
