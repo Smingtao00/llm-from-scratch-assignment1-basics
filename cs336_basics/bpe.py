@@ -1,4 +1,5 @@
 import os
+import heapq
 import multiprocessing as mp
 from collections import Counter, defaultdict
 from typing import BinaryIO
@@ -98,10 +99,13 @@ def process_chunk(
 
 def get_pairs(pre_tokens: dict[tuple[bytes], int]) -> dict[tuple[bytes], int]:
     pair_cnt = defaultdict(int)
+    pair2word = defaultdict(set) 
     for word_bytes, cnt in pre_tokens.items():
-        for pair in zip(word_bytes[:-1], word_bytes[1:]):
+        for i in range(len(word_bytes) - 1):
+            pair = (word_bytes[i], word_bytes[i + 1])
             pair_cnt[pair] += cnt
-    return pair_cnt
+            pair2word[pair].add(word_bytes)
+    return pair_cnt, pair2word
 
 
 def get_max_pair(pair_cnt: dict[tuple[bytes], int]) -> tuple[bytes]:
@@ -109,16 +113,19 @@ def get_max_pair(pair_cnt: dict[tuple[bytes], int]) -> tuple[bytes]:
     return max_pair
 
 
-def update_cnt(word_cnt, pair_cnt, merge_pair):
-    new_word_cnt = defaultdict(int)
+def update_cnt(word_cnt, pair_cnt, pair2word, merge_pair):
+    new_word_cnt = defaultdict(int, word_cnt)
     new_pair_cnt = defaultdict(int, pair_cnt)
 
-    for word_bytes, cnt in word_cnt.items():
-
-        old_pairs = list(zip(word_bytes[:-1], word_bytes[1:]))
-        if merge_pair not in old_pairs:
-            new_word_cnt[word_bytes] += cnt
-            continue
+    for word_bytes in list(pair2word[merge_pair]):
+        cnt = word_cnt[word_bytes]
+        del new_word_cnt[word_bytes]
+        for i in range(len(word_bytes) - 1):
+            pair = (word_bytes[i], word_bytes[i + 1])
+            try: 
+                pair2word[pair].remove(word_bytes)
+            except:
+                pass
 
         merged = merge_pair[0] + merge_pair[1]
         new_word_bytes = []
@@ -147,6 +154,9 @@ def update_cnt(word_cnt, pair_cnt, merge_pair):
                 new_word_bytes.append(word_bytes[i])
                 i += 1
         
+        for i in range(len(new_word_bytes) - 1):
+            pair2word[(new_word_bytes[i], new_word_bytes[i + 1])].add(tuple(new_word_bytes))
+
         new_word_cnt[tuple(new_word_bytes)] += cnt
     return new_word_cnt, new_pair_cnt
 
@@ -162,7 +172,12 @@ def bpe(
     for token in special_tokens:
         vocab[next_id] = token.encode("utf-8")
         next_id += 1
-
+    
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # 如果已经设置过启动模式，会抛出 RuntimeError，可以忽略
+        pass
 
     with open(input_path, "rb") as f:
         num_processes = 8
@@ -178,13 +193,13 @@ def bpe(
         pre_tokens = merge_results(results)
         #print(pre_tokens)
     
-    pair_cnt = get_pairs(pre_tokens)
+    pair_cnt, pair2word = get_pairs(pre_tokens)
     
     for i in range(next_id, vocab_size):
         max_pair = get_max_pair(pair_cnt)
         vocab[i] = max_pair[0] + max_pair[1]
         merges.append(max_pair)
-        pre_tokens, pair_cnt = update_cnt(pre_tokens, pair_cnt, max_pair)
+        pre_tokens, pair_cnt = update_cnt(pre_tokens, pair_cnt, pair2word, max_pair)
         
     return vocab, merges
 
