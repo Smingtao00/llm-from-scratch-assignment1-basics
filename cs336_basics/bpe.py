@@ -1,5 +1,4 @@
 import os
-import heapq
 import multiprocessing as mp
 from collections import Counter, defaultdict
 from typing import BinaryIO

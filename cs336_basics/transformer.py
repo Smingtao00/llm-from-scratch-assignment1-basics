@@ -3,6 +3,8 @@ import torch.nn as nn
 from einops import einsum
 from jaxtyping import Float,Bool,Int
 import math
+import typing
+import os
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -345,6 +347,7 @@ class transformer_lm(nn.Module):
         # (batch_size, seq_len, vocab_size)
         return logits
 
+
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor):
     """
     logits: (batch_size, vocab_size)
@@ -361,6 +364,7 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor):
     losses = -target_logits + log_sum_exp
 
     return torch.mean(losses)
+
 
 class AdamW(torch.optim.Optimizer):
     def __init__(
@@ -425,3 +429,92 @@ class AdamW(torch.optim.Optimizer):
                 p.data.add_(p.data, alpha=-lr*weight_decay)
 
         return loss
+
+
+def cosine_lr_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+) -> float:
+    if it < warmup_iters:
+        return (it / warmup_iters) * max_learning_rate
+    elif it <= cosine_cycle_iters:
+        return min_learning_rate + (1 + math.cos((it - warmup_iters)/(cosine_cycle_iters - warmup_iters) * math.pi)) * 0.5 * (max_learning_rate - min_learning_rate)
+    else:
+        return min_learning_rate
+
+
+def gradient_clipping(parameters, max_l2_norm: float) -> None:
+    eps = 1e-6
+    gradients = []
+    for param in parameters:
+        if param.grad is not None:
+            gradients.append(param.grad)
+    
+    if not gradients:
+        return
+    
+    total_norm = 0.0
+    for grad in gradients:
+        total_norm += grad.norm().item() ** 2
+    total_norm = total_norm ** 0.5
+
+    if total_norm > max_l2_norm:
+        clip_coef = max_l2_norm / (total_norm + eps)
+        for grad in gradients:
+            grad.mul_(clip_coef)
+
+
+def get_batch(dataset, batch_size: int, context_length: int, device: str):
+    import numpy as np
+
+    max_start_idx = len(dataset) - context_length
+
+    start_indices = np.random.randint(0, max_start_idx, size=batch_size)
+
+    input_sequences = []
+    target_sequences = []
+
+    for start_idx in start_indices:
+        input_seq = dataset[start_idx:start_idx + context_length]
+        target_seq = dataset[start_idx + 1:start_idx + context_length + 1]
+        input_sequences.append(input_seq)
+        target_sequences.append(target_seq)
+    
+    input_array = np.array(input_sequences)
+    target_array = np.array(target_sequences)
+
+    input_tensor = torch.from_numpy(input_array).long().to(device)
+    target_tensor = torch.from_numpy(target_array).long().to(device)
+
+    return input_tensor, target_tensor
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+):
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+
+    torch.save(checkpoint, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer
+):
+    checkpoint = torch.load(src)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    return checkpoint['iteration']

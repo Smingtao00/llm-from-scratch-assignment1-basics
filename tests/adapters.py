@@ -175,40 +175,19 @@ def run_rmsnorm(
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
-    """Given a tensor of inputs, return the output of applying SiLU
-    to each element.
-
-    Args:
-        in_features(Float[Tensor, "..."]): Input features to run SiLU on. Shape is arbitrary.
-
-    Returns:
-        Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
-        SiLU to each element.
-    """
-    raise NotImplementedError
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Given a dataset (a 1D numpy array of integers) and a desired batch size and
-    context length, sample language modeling input sequences and their corresponding
-    labels from the dataset.
 
-    Args:
-        dataset (np.array): 1D numpy array of integer token IDs in the dataset.
-        batch_size (int): Desired batch size to sample.
-        context_length (int): Desired context length of each sampled example.
-        device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
-            to place the sampled input sequences and labels on.
-
-    Returns:
-        Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
-        is the sampled input sequences, and the second tuple item is the corresponding
-        language modeling labels.
-    """
-    raise NotImplementedError
+    return tuple(get_batch(
+        dataset=dataset,
+        batch_size=batch_size,
+        context_length=context_length,
+        device=device
+    ))
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -217,37 +196,14 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
 ) -> Float[Tensor, ""]:
-    """Given a tensor of inputs and targets, compute the average cross-entropy
-    loss across examples.
-
-    Args:
-        inputs (Float[Tensor, "batch_size vocab_size"]): inputs[i][j] is the
-            unnormalized logit of jth class for the ith example.
-        targets (Int[Tensor, "batch_size"]): Tensor of shape (batch_size,) with the index of the correct class.
-            Each value must be between 0 and `num_classes - 1`.
-
-    Returns:
-        Float[Tensor, ""]: The average cross-entropy loss across examples.
-    """
     return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
-    """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
-
-    Args:
-        parameters (Iterable[torch.nn.Parameter]): collection of trainable parameters.
-        max_l2_norm (float): a positive value containing the maximum l2-norm.
-
-    The gradients of the parameters (parameter.grad) should be modified in-place.
-    """
-    raise NotImplementedError
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
-    """
-    Returns a torch.optim.Optimizer that implements AdamW.
-    """
     return AdamW
 
 
@@ -258,25 +214,13 @@ def run_get_lr_cosine_schedule(
     warmup_iters: int,
     cosine_cycle_iters: int,
 ):
-    """
-    Given the parameters of a cosine learning rate decay schedule (with linear
-    warmup) and an iteration number, return the learning rate at the given
-    iteration under the specified schedule.
-
-    Args:
-        it (int): Iteration number to get learning rate for.
-        max_learning_rate (float): alpha_max, the maximum learning rate for
-            cosine learning rate schedule (with warmup).
-        min_learning_rate (float): alpha_min, the minimum / final learning rate for
-            the cosine learning rate schedule (with warmup).
-        warmup_iters (int): T_w, the number of iterations to linearly warm-up
-            the learning rate.
-        cosine_cycle_iters (int): T_c, the number of cosine annealing iterations.
-
-    Returns:
-        Learning rate at the given iteration under the specified schedule.
-    """
-    raise NotImplementedError
+    return cosine_lr_schedule(
+        it=it,
+        max_learning_rate=max_learning_rate,
+        min_learning_rate=min_learning_rate,
+        warmup_iters=warmup_iters,
+        cosine_cycle_iters=cosine_cycle_iters
+    )
 
 
 def run_save_checkpoint(
@@ -285,17 +229,12 @@ def run_save_checkpoint(
     iteration: int,
     out: str | os.PathLike | BinaryIO | IO[bytes],
 ):
-    """
-    Given a model, optimizer, and an iteration number, serialize them to disk.
-
-    Args:
-        model (torch.nn.Module): Serialize the state of this model.
-        optimizer (torch.optim.Optimizer): Serialize the state of this optimizer.
-        iteration (int): Serialize this value, which represents the number of training iterations
-            we've completed.
-        out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
-    """
-    raise NotImplementedError
+    save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        iteration=iteration,
+        out=out
+    )
 
 
 def run_load_checkpoint(
@@ -303,20 +242,11 @@ def run_load_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> int:
-    """
-    Given a serialized checkpoint (path or file-like object), restore the
-    serialized state to the given model and optimizer.
-    Return the number of iterations that we previously serialized in
-    the checkpoint.
-
-    Args:
-        src (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialized checkpoint.
-        model (torch.nn.Module): Restore the state of this model.
-        optimizer (torch.optim.Optimizer): Restore the state of this optimizer.
-    Returns:
-        int: the previously-serialized number of iterations.
-    """
-    raise NotImplementedError
+    return load_checkpoint(
+        src=src,
+        model=model,
+        optimizer=optimizer
+    )
 
 
 def get_tokenizer(
