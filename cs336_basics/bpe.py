@@ -116,7 +116,13 @@ def update_cnt(word_cnt, pair_cnt, pair2word, merge_pair):
     new_word_cnt = defaultdict(int, word_cnt)
     new_pair_cnt = defaultdict(int, pair_cnt)
 
-    for word_bytes in list(pair2word[merge_pair]):
+    affected_words = list(pair2word[merge_pair])
+    if not affected_words:
+        if merge_pair in new_pair_cnt:
+            del new_pair_cnt[merge_pair]
+        return new_word_cnt, new_pair_cnt
+
+    for word_bytes in affected_words: 
         cnt = word_cnt[word_bytes]
         del new_word_cnt[word_bytes]
         for i in range(len(word_bytes) - 1):
@@ -152,11 +158,17 @@ def update_cnt(word_cnt, pair_cnt, pair2word, merge_pair):
             else:
                 new_word_bytes.append(word_bytes[i])
                 i += 1
-        
+
         for i in range(len(new_word_bytes) - 1):
             pair2word[(new_word_bytes[i], new_word_bytes[i + 1])].add(tuple(new_word_bytes))
 
         new_word_cnt[tuple(new_word_bytes)] += cnt
+
+    pairs_to_delete = [p for p, cnt in new_pair_cnt.items() if cnt == 0]
+    for p in pairs_to_delete:
+        del new_pair_cnt[p]
+        if p in pair2word and not pair2word[p]:
+            del pair2word[p]
     return new_word_cnt, new_pair_cnt
 
 def bpe(
@@ -193,12 +205,14 @@ def bpe(
         #print(pre_tokens)
     
     pair_cnt, pair2word = get_pairs(pre_tokens)
-    
-    for i in range(next_id, vocab_size):
+
+    i = next_id
+    while i < vocab_size:
         max_pair = get_max_pair(pair_cnt)
         vocab[i] = max_pair[0] + max_pair[1]
         merges.append(max_pair)
         pre_tokens, pair_cnt = update_cnt(pre_tokens, pair_cnt, pair2word, max_pair)
+        i += 1
         
     return vocab, merges
 
@@ -264,13 +278,28 @@ class Tokenizer:
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
         with open(vocab_filepath, 'r', encoding = 'utf-8') as vf:
             vocab_data = json.load(vf)
-            vocab = {int(k): bytes(v, 'latin1') if isinstance(v, str) else bytes(v) for k, v in vocab_data.items()}
+            vocab = {}
+            for k, v in vocab_data.items():
+                if isinstance(v, str):
+                    try:
+                        vocab[int(k)] = v.encode('latin-1')
+                    except UnicodeEncodeError:
+                        vocab[int(k)] = v.encode('utf-8')
+                else:
+                    vocab[int(k)] = bytes(v)
 
         # 假设都是 ("a b")
-        with open(merges_filepath, 'r', encoding = 'utf-8') as mf:
-            lines = mf.readlines()
-            merge_pairs = [tuple(line.strip().split()) for line in lines if not line.startswith('#') and line.strip()]
-            merges = [(a.encode('utf-8'), b.encode('utf-8')) for a, b in merge_pairs]
+        merges = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:  # 跳过空行
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 2:
+                    a, b = parts[0], parts[1]
+                    merges.append((a.encode('utf-8'), b.encode('utf-8')))
 
         return cls(vocab = vocab, merges = merges, special_tokens = special_tokens)
 
@@ -291,3 +320,4 @@ class Tokenizer:
     def decode(self, ids: list[int]) -> str:
         return b''.join([self.vocab[t] for t in ids]).decode('utf-8', errors = 'replace')
     
+

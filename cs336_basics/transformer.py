@@ -5,6 +5,7 @@ from jaxtyping import Float,Bool,Int
 import math
 import typing
 import os
+import wandb
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -346,6 +347,30 @@ class transformer_lm(nn.Module):
         logits = self.lm_head(y)
         # (batch_size, seq_len, vocab_size)
         return logits
+
+    @torch.no_grad()
+    def generate(
+        self, 
+        prompt_ids: torch.Tensor | list[int],
+        max_new_tokens: int,
+        eos_id: int | None = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        context_length: int | None = None,
+        rng: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        from cs336_basics.decoding import generate_tokens
+        return generate_tokens(
+            self, 
+            prompt_ids=prompt_ids,
+            max_new_tokens=max_new_tokens,
+            eos_id=eos_id,
+            temperature=temperature,
+            top_p=top_p,
+            context_length=context_length,
+            rng=rng
+        )
+
 
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor):
